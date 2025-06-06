@@ -1,340 +1,479 @@
-// --- Libraries ---
+// 🔥 Smart Thermostat - Full Sketch - ESP32 RS485, LVGL, MQTT, OTA, Eco Mode, Save Settings 🔥
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <Preferences.h>
+#include <ArduinoOTA.h>
+#include <HardwareSerial.h>
 #include <lvgl.h>
-#include <TFT_eSPI.h>          // TFT library for ESP32-S3 screen
-#include <OneWire.h>           // For DS18B20
-#include <DallasTemperature.h> // For DS18B20
-#include <WiFi.h>              // WiFi
-#include <PubSubClient.h>      // MQTT
+#include <TFT_eSPI.h>
 
-// --- RS485 Definitions ---
-#define RS485_TX 13
-#define RS485_RX 14
-#define RS485_EN 21
-
+#define RS485_TX 17
+#define RS485_RX 16
+#define RS485_EN 4
 HardwareSerial RS485Serial(2);
 
-// --- DS18B20 Setup ---
-#define ONE_WIRE_BUS 2
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature sensors(&oneWire);
+#define BACKLIGHT_PIN 21
+const int BACKLIGHT_CHANNEL = 0;
+const int PWM_FREQ = 5000;
+const int PWM_RESOLUTION = 8;
 
-// --- LVGL Display Setup ---
-TFT_eSPI tft = TFT_eSPI(); // Use TFT_eSPI
+TFT_eSPI tft = TFT_eSPI();
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", -5 * 3600, 60000); // Timezone: EST (adjust as needed)
+Preferences preferences;
 
-// --- WiFi and MQTT Setup ---
+// WiFi and MQTT
 const char* ssid = "YOUR_WIFI_SSID";
 const char* password = "YOUR_WIFI_PASSWORD";
-
-const char* mqtt_server = "YOUR_MQTT_BROKER_IP"; // Example: 192.168.1.100
-const char* mqtt_user = "YOUR_MQTT_USERNAME";    // Or leave "" if not needed
-const char* mqtt_password = "YOUR_MQTT_PASSWORD"; // Or leave "" if not needed
+const char* mqtt_server = "YOUR_MQTT_BROKER_IP";
+const char* mqtt_user = "YOUR_MQTT_USER";
+const char* mqtt_password = "YOUR_MQTT_PASSWORD";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// --- Global Variables ---
-lv_obj_t *label_current_temp;
-lv_obj_t *label_heat_sp;
-lv_obj_t *label_cool_sp;
-lv_obj_t *label_status;
-lv_obj_t *label_fan;
-lv_obj_t *label_mode;
-
-uint8_t heatSetpoint = 68;
-uint8_t coolSetpoint = 75;
+// Variables
+uint8_t heatSetpoint, coolSetpoint, fanMode, globalMode;
 float currentTemp = 72.0;
 
-uint8_t fanMode = 0; // 0=Auto, 1=High, 2=Low
-uint8_t globalMode = 3; // Start in Auto
+bool ecoModeActive = false;
+uint8_t normalHeatSetpoint, normalCoolSetpoint;
+const uint8_t ecoHeatSetpoint = 62;
+const uint8_t ecoCoolSetpoint = 78;
+int ecoStartHour, ecoEndHour;
 
-// Mode definitions
-#define MODE_OFF  0
-#define MODE_COOL 1
-#define MODE_HEAT 2
-#define MODE_AUTO 3
+unsigned long lastTouch = 0;
+bool screenSaverActive = false;
 
-unsigned long lastSend = 0;
-unsigned long lastTempRead = 0;
+// UI
+lv_obj_t *labelTemp, *labelHeat, *labelCool, *labelMode, *labelFan, *labelEco, *labelEcoTimes;
 
-// --- WiFi Connect ---
-void setup_wifi() {
-  delay(10);
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-  WiFi.begin(ssid, password);
+void setup_wifi();
+void reconnect();
+void mqtt_publish_status();
+void publish_discovery();
+void callback(char*, byte*, unsigned int);
+void save_settings();
+void save_eco_times();
+void start_boost(uint8_t mode);
+void stop_boost();
+void activate_eco_mode();
+void deactivate_eco_mode();
+void set_brightness(uint8_t brightness);
+void check_eco_mode();
+void create_ui();
+void update_ui();
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("WiFi connected");
-}
+// LVGL Event Handlers
+void heat_up_cb(lv_event_t *e);
+void heat_down_cb(lv_event_t *e);
+void cool_up_cb(lv_event_t *e);
+void cool_down_cb(lv_event_t *e);
+void mode_cb(lv_event_t *e);
+void fan_cb(lv_event_t *e);
+void eco_cb(lv_event_t *e);
+void eco_start_up_cb(lv_event_t *e);
+void eco_start_down_cb(lv_event_t *e);
+void eco_end_up_cb(lv_event_t *e);
+void eco_end_down_cb(lv_event_t *e);
 
-// --- MQTT Connect ---
-void reconnect() {
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    if (client.connect("ESP32Thermostat", mqtt_user, mqtt_password)) {
-      Serial.println("connected");
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      delay(5000);
-    }
-  }
-}
-
-// --- MQTT Publish ---
-void mqtt_publish_status() {
-  client.publish("thermostat/current_temp", String(currentTemp).c_str(), true);
-  client.publish("thermostat/heat_setpoint", String(heatSetpoint).c_str(), true);
-  client.publish("thermostat/cool_setpoint", String(coolSetpoint).c_str(), true);
-  client.publish("thermostat/mode", String(globalMode).c_str(), true);
-}
-
-// --- LVGL Flush ---
-void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
-  uint32_t w = (area->x2 - area->x1 + 1);
-  uint32_t h = (area->y2 - area->y1 + 1);
-
-  tft.startWrite();
-  tft.setAddrWindow(area->x1, area->y1, w, h);
-  tft.pushColors((uint16_t *)&color_p->full, w * h, true);
-  tft.endWrite();
-
-  lv_disp_flush_ready(disp);
-}
-
-// --- RS485 Packet Send ---
-void sendRS485Packet() {
-  uint8_t packet[] = {
-    0xF6,
-    (uint8_t)(heatSetpoint + 82),
-    zone1Mode(),
-    fanModeCode(fanMode),
-    (uint8_t)(coolSetpoint + 82),
-    zone2Mode(),
-    fanModeCode(fanMode),
-    0xFF
-  };
-
-  digitalWrite(RS485_EN, HIGH);
-  delay(2);
-  RS485Serial.write(packet, sizeof(packet));
-  RS485Serial.flush();
-  digitalWrite(RS485_EN, LOW);
-}
-
-uint8_t fanModeCode(uint8_t mode) {
-  switch (mode) {
-    case 0: return 0xD9; // Auto
-    case 1: return 0x33; // High
-    case 2: return 0xB2; // Low
-    default: return 0xD9;
-  }
-}
-
-// --- Auto Mode Logic ---
-uint8_t zone1Mode() {
-  if (globalMode == MODE_AUTO) {
-    float deadband = 3.0;
-    if (currentTemp <= heatSetpoint - deadband) return 0x02; // Heat
-    if (currentTemp >= coolSetpoint + deadband) return 0x03; // Cool
-    return 0x00; // Off
-  } else if (globalMode == MODE_COOL) {
-    return 0x03;
-  } else if (globalMode == MODE_HEAT) {
-    return 0x02;
-  }
-  return 0x00;
-}
-
-uint8_t zone2Mode() {
-  if (globalMode == MODE_AUTO) {
-    float deadband = 3.0;
-    if (currentTemp >= coolSetpoint + deadband) return 0x03;
-    return 0x00;
-  } else if (globalMode == MODE_COOL) {
-    return 0x03;
-  }
-  return 0x00;
-}
-
-// --- UI Update ---
-void update_ui() {
-  static char temp_buf[32];
-  static char heat_buf[32];
-  static char cool_buf[32];
-  static char status_buf[32];
-  static char fan_buf[32];
-  static char mode_buf[32];
-
-  snprintf(temp_buf, sizeof(temp_buf), "Room Temp: %.1f°F", currentTemp);
-  snprintf(heat_buf, sizeof(heat_buf), "Heat SP: %d°F", heatSetpoint);
-  snprintf(cool_buf, sizeof(cool_buf), "Cool SP: %d°F", coolSetpoint);
-
-  uint8_t z1Mode = zone1Mode();
-  if (globalMode == MODE_OFF) {
-    snprintf(status_buf, sizeof(status_buf), "Status: OFF");
-  } else if (z1Mode == 0x02) {
-    snprintf(status_buf, sizeof(status_buf), "Status: Heating...");
-  } else if (z1Mode == 0x03) {
-    snprintf(status_buf, sizeof(status_buf), "Status: Cooling...");
-  } else {
-    snprintf(status_buf, sizeof(status_buf), "Status: Idle");
-  }
-
-  snprintf(fan_buf, sizeof(fan_buf), "Fan: %s", (fanMode == 0) ? "Auto" : (fanMode == 1) ? "High" : "Low");
-
-  const char *modeNames[] = {"Off", "Cool", "Heat", "Auto"};
-  snprintf(mode_buf, sizeof(mode_buf), "Mode: %s", modeNames[globalMode]);
-
-  lv_label_set_text(label_current_temp, temp_buf);
-  lv_label_set_text(label_heat_sp, heat_buf);
-  lv_label_set_text(label_cool_sp, cool_buf);
-  lv_label_set_text(label_status, status_buf);
-  lv_label_set_text(label_fan, fan_buf);
-  lv_label_set_text(label_mode, mode_buf);
-}
-
-// --- Button Handlers ---
-void heat_up_cb(lv_event_t *e) { heatSetpoint++; update_ui(); }
-void heat_down_cb(lv_event_t *e) { heatSetpoint--; update_ui(); }
-void cool_up_cb(lv_event_t *e) { coolSetpoint++; update_ui(); }
-void cool_down_cb(lv_event_t *e) { coolSetpoint--; update_ui(); }
-void mode_toggle_cb(lv_event_t *e) {
-  globalMode = (globalMode + 1) % 4;
-  update_ui();
-}
-void fan_toggle_cb(lv_event_t *e) {
-  fanMode = (fanMode + 1) % 3;
-  update_ui();
-}
-
-// --- Create UI ---
-void create_ui() {
-  lv_obj_t *scr = lv_scr_act();
-
-  label_current_temp = lv_label_create(scr);
-  lv_label_set_text(label_current_temp, "Room Temp: --°F");
-  lv_obj_align(label_current_temp, LV_ALIGN_TOP_MID, 0, 10);
-
-  label_heat_sp = lv_label_create(scr);
-  lv_label_set_text(label_heat_sp, "Heat SP: 68°F");
-  lv_obj_align(label_heat_sp, LV_ALIGN_TOP_LEFT, 20, 50);
-
-  lv_obj_t *btn_heat_up = lv_btn_create(scr);
-  lv_obj_align(btn_heat_up, LV_ALIGN_TOP_LEFT, 200, 40);
-  lv_obj_t *label1 = lv_label_create(btn_heat_up);
-  lv_label_set_text(label1, "+");
-  lv_obj_add_event_cb(btn_heat_up, heat_up_cb, LV_EVENT_CLICKED, NULL);
-
-  lv_obj_t *btn_heat_down = lv_btn_create(scr);
-  lv_obj_align(btn_heat_down, LV_ALIGN_TOP_LEFT, 260, 40);
-  lv_obj_t *label2 = lv_label_create(btn_heat_down);
-  lv_label_set_text(label2, "-");
-  lv_obj_add_event_cb(btn_heat_down, heat_down_cb, LV_EVENT_CLICKED, NULL);
-
-  label_cool_sp = lv_label_create(scr);
-  lv_label_set_text(label_cool_sp, "Cool SP: 75°F");
-  lv_obj_align(label_cool_sp, LV_ALIGN_TOP_LEFT, 20, 100);
-
-  lv_obj_t *btn_cool_up = lv_btn_create(scr);
-  lv_obj_align(btn_cool_up, LV_ALIGN_TOP_LEFT, 200, 90);
-  lv_obj_t *label3 = lv_label_create(btn_cool_up);
-  lv_label_set_text(label3, "+");
-  lv_obj_add_event_cb(btn_cool_up, cool_up_cb, LV_EVENT_CLICKED, NULL);
-
-  lv_obj_t *btn_cool_down = lv_btn_create(scr);
-  lv_obj_align(btn_cool_down, LV_ALIGN_TOP_LEFT, 260, 90);
-  lv_obj_t *label4 = lv_label_create(btn_cool_down);
-  lv_label_set_text(label4, "-");
-  lv_obj_add_event_cb(btn_cool_down, cool_down_cb, LV_EVENT_CLICKED, NULL);
-
-  label_status = lv_label_create(scr);
-  lv_label_set_text(label_status, "Status: --");
-  lv_obj_align(label_status, LV_ALIGN_TOP_LEFT, 20, 150);
-
-  label_mode = lv_label_create(scr);
-  lv_label_set_text(label_mode, "Mode: AUTO");
-  lv_obj_align(label_mode, LV_ALIGN_TOP_LEFT, 20, 200);
-
-  lv_obj_t *btn_mode = lv_btn_create(scr);
-  lv_obj_align(btn_mode, LV_ALIGN_TOP_LEFT, 200, 190);
-  lv_obj_t *label5 = lv_label_create(btn_mode);
-  lv_label_set_text(label5, "Mode");
-  lv_obj_add_event_cb(btn_mode, mode_toggle_cb, LV_EVENT_CLICKED, NULL);
-
-  label_fan = lv_label_create(scr);
-  lv_label_set_text(label_fan, "Fan: Auto");
-  lv_obj_align(label_fan, LV_ALIGN_TOP_LEFT, 20, 250);
-
-  lv_obj_t *btn_fan = lv_btn_create(scr);
-  lv_obj_align(btn_fan, LV_ALIGN_TOP_LEFT, 200, 240);
-  lv_obj_t *label6 = lv_label_create(btn_fan);
-  lv_label_set_text(label6, "Fan");
-  lv_obj_add_event_cb(btn_fan, fan_toggle_cb, LV_EVENT_CLICKED, NULL);
-
-  update_ui();
-}
-
-// --- Setup ---
 void setup() {
   Serial.begin(115200);
 
-  setup_wifi();
-  client.setServer(mqtt_server, 1883);
-
-  // RS485 Setup
+  // RS485
   pinMode(RS485_EN, OUTPUT);
   digitalWrite(RS485_EN, LOW);
   RS485Serial.begin(9600, SERIAL_8N1, RS485_RX, RS485_TX);
 
-  // DS18B20 Setup
-  sensors.begin();
+  // WiFi
+  setup_wifi();
 
-  // TFT and LVGL Setup
-  lv_init();
+  // MQTT
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+
+  // OTA
+  ArduinoOTA.setHostname("ThermostatESP32");
+  ArduinoOTA.begin();
+
+  // Backlight PWM
+  ledcSetup(BACKLIGHT_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(BACKLIGHT_PIN, BACKLIGHT_CHANNEL);
+  set_brightness(255);
+
+  // Preferences
+  preferences.begin("thermostat", false);
+  heatSetpoint = preferences.getUChar("heatSet", 68);
+  coolSetpoint = preferences.getUChar("coolSet", 75);
+  fanMode = preferences.getUChar("fanMode", 0);
+  globalMode = preferences.getUChar("modeSet", 3);
+  ecoStartHour = preferences.getInt("ecoStart", 22);
+  ecoEndHour = preferences.getInt("ecoEnd", 6);
+
+  // NTP
+  timeClient.begin();
+
+  // TFT and LVGL
   tft.begin();
   tft.setRotation(1);
-  
-  static lv_disp_draw_buf_t draw_buf;
-  static lv_color_t buf1[480 * 10];
-  lv_disp_draw_buf_init(&draw_buf, buf1, NULL, 480 * 10);
-
+  lv_init();
+  lv_disp_draw_buf_t draw_buf;
+  static lv_color_t buf[LV_HOR_RES_MAX * 10];
+  lv_disp_draw_buf_init(&draw_buf, buf, NULL, LV_HOR_RES_MAX * 10);
   static lv_disp_drv_t disp_drv;
   lv_disp_drv_init(&disp_drv);
-  disp_drv.hor_res = 480;
-  disp_drv.ver_res = 320;
-  disp_drv.flush_cb = my_disp_flush;
+  disp_drv.hor_res = 320;
+  disp_drv.ver_res = 240;
+  disp_drv.flush_cb = [](lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
+    uint32_t w = (area->x2 - area->x1 + 1);
+    uint32_t h = (area->y2 - area->y1 + 1);
+    tft.startWrite();
+    tft.setAddrWindow(area->x1, area->y1, w, h);
+    tft.pushColors((uint16_t *)&color_p->full, w * h, true);
+    tft.endWrite();
+    lv_disp_flush_ready(disp);
+  };
   disp_drv.draw_buf = &draw_buf;
   lv_disp_drv_register(&disp_drv);
 
   create_ui();
 }
 
-// --- Main Loop ---
 void loop() {
-  if (!client.connected()) {
-    reconnect();
-  }
+  if (!client.connected()) reconnect();
   client.loop();
-
+  ArduinoOTA.handle();
+  timeClient.update();
+  check_eco_mode();
   lv_timer_handler();
   delay(5);
 
-  if (millis() - lastTempRead > 2000) {
-    sensors.requestTemperatures();
-    currentTemp = sensors.getTempFByIndex(0);
-    update_ui();
-    lastTempRead = millis();
-
-    mqtt_publish_status();
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+    unsigned long startAttempt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) delay(500);
   }
+}
 
-  if (millis() - lastSend > 5000) {
-    sendRS485Packet();
-    lastSend = millis();
+// -------------------- WiFi and MQTT -----------------------
+void setup_wifi() {
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    if (client.connect("ESP32Thermostat", mqtt_user, mqtt_password)) {
+      publish_discovery();
+      client.subscribe("thermostat/heat_setpoint/set");
+      client.subscribe("thermostat/cool_setpoint/set");
+      client.subscribe("thermostat/mode/set");
+      client.subscribe("thermostat/fan_mode/set");
+      client.subscribe("thermostat/boost/set");
+    } else {
+      delay(5000);
+    }
   }
+}
+
+void mqtt_publish_status() {
+  client.publish("thermostat/current_temp", String(currentTemp).c_str(), true);
+  client.publish("thermostat/heat_setpoint", String(heatSetpoint).c_str(), true);
+  client.publish("thermostat/cool_setpoint", String(coolSetpoint).c_str(), true);
+  client.publish("thermostat/mode", String(globalMode).c_str(), true);
+  client.publish("thermostat/fan_mode", (fanMode == 0) ? "auto" : "on", true);
+}
+
+void publish_discovery() {
+  String topic = "homeassistant/climate/smart_thermostat_001/config";
+  String payload = "{";
+  payload += "\"name\":\"Smart Thermostat\",";
+  payload += "\"uniq_id\":\"smart_thermostat_001\",";
+  payload += "\"curr_temp_t\":\"thermostat/current_temp\",";
+  payload += "\"mode_state_topic\":\"thermostat/mode\",";
+  payload += "\"mode_cmd_t\":\"thermostat/mode/set\",";
+  payload += "\"modes\":[\"off\",\"cool\",\"heat\",\"auto\"],";
+  payload += "\"temp_stat_t\":\"thermostat/current_temp\",";
+  payload += "\"temp_low_stat_t\":\"thermostat/heat_setpoint\",";
+  payload += "\"temp_low_cmd_t\":\"thermostat/heat_setpoint/set\",";
+  payload += "\"temp_high_stat_t\":\"thermostat/cool_setpoint\",";
+  payload += "\"temp_high_cmd_t\":\"thermostat/cool_setpoint/set\",";
+  payload += "\"fan_modes\":[\"auto\",\"on\"],";
+  payload += "\"fan_mode_state_topic\":\"thermostat/fan_mode\",";
+  payload += "\"fan_mode_command_topic\":\"thermostat/fan_mode/set\",";
+  payload += "\"min_temp\":50,";
+  payload += "\"max_temp\":90,";
+  payload += "\"temp_step\":1,";
+  payload += "\"temp_unit\":\"F\",";
+  payload += "\"qos\":1";
+  payload += "}";
+  client.publish(topic.c_str(), payload.c_str(), true);
+}
+
+void callback(char* topic, byte* message, unsigned int length) {
+  String topicStr = String(topic);
+  String payload;
+  for (int i = 0; i < length; i++) payload += (char)message[i];
+
+  if (topicStr == "thermostat/heat_setpoint/set") heatSetpoint = payload.toInt();
+  else if (topicStr == "thermostat/cool_setpoint/set") coolSetpoint = payload.toInt();
+  else if (topicStr == "thermostat/mode/set") globalMode = payload.toInt();
+  else if (topicStr == "thermostat/fan_mode/set") fanMode = (payload == "auto") ? 0 : 1;
+}
+
+// -------------------- ECO and Settings Save -----------------------
+void save_settings() {
+  preferences.putUChar("heatSet", heatSetpoint);
+  preferences.putUChar("coolSet", coolSetpoint);
+  preferences.putUChar("fanMode", fanMode);
+  preferences.putUChar("modeSet", globalMode);
+}
+
+void save_eco_times() {
+  preferences.putInt("ecoStart", ecoStartHour);
+  preferences.putInt("ecoEnd", ecoEndHour);
+}
+
+void start_boost(uint8_t mode) {
+  // For future boost mode features if needed
+}
+
+void stop_boost() {
+  // For future boost mode features if needed
+}
+
+void activate_eco_mode() {
+  normalHeatSetpoint = heatSetpoint;
+  normalCoolSetpoint = coolSetpoint;
+  heatSetpoint = ecoHeatSetpoint;
+  coolSetpoint = ecoCoolSetpoint;
+  ecoModeActive = true;
+  set_brightness(80); // Eco dim
+  update_ui();
+}
+
+void deactivate_eco_mode() {
+  heatSetpoint = normalHeatSetpoint;
+  coolSetpoint = normalCoolSetpoint;
+  ecoModeActive = false;
+  set_brightness(255); // Full bright
+  update_ui();
+}
+
+void set_brightness(uint8_t brightness) {
+  ledcWrite(BACKLIGHT_CHANNEL, brightness);
+}
+
+void check_eco_mode() {
+  int currentHour = timeClient.getHours();
+  if (ecoStartHour <= ecoEndHour) {
+    if (currentHour >= ecoStartHour && currentHour < ecoEndHour) {
+      if (!ecoModeActive) activate_eco_mode();
+    } else {
+      if (ecoModeActive) deactivate_eco_mode();
+    }
+  } else {
+    if (currentHour >= ecoStartHour || currentHour < ecoEndHour) {
+      if (!ecoModeActive) activate_eco_mode();
+    } else {
+      if (ecoModeActive) deactivate_eco_mode();
+    }
+  }
+}
+
+// -------------------- LVGL UI -----------------------
+void create_ui() {
+  lv_obj_t *scr = lv_scr_act();
+
+  labelTemp = lv_label_create(scr);
+  lv_obj_align(labelTemp, LV_ALIGN_TOP_MID, 0, 20);
+
+  // Heat Setpoint
+  lv_obj_t *btnHeatUp = lv_btn_create(scr);
+  lv_obj_align(btnHeatUp, LV_ALIGN_LEFT_MID, 10, -40);
+  lv_obj_t *labelHU = lv_label_create(btnHeatUp);
+  lv_label_set_text(labelHU, "Heat +");
+  lv_obj_add_event_cb(btnHeatUp, heat_up_cb, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *btnHeatDown = lv_btn_create(scr);
+  lv_obj_align(btnHeatDown, LV_ALIGN_LEFT_MID, 10, 0);
+  lv_obj_t *labelHD = lv_label_create(btnHeatDown);
+  lv_label_set_text(labelHD, "Heat -");
+  lv_obj_add_event_cb(btnHeatDown, heat_down_cb, LV_EVENT_CLICKED, NULL);
+
+  labelHeat = lv_label_create(scr);
+  lv_obj_align(labelHeat, LV_ALIGN_LEFT_MID, 10, 40);
+
+  // Cool Setpoint
+  lv_obj_t *btnCoolUp = lv_btn_create(scr);
+  lv_obj_align(btnCoolUp, LV_ALIGN_RIGHT_MID, -10, -40);
+  lv_obj_t *labelCU = lv_label_create(btnCoolUp);
+  lv_label_set_text(labelCU, "Cool +");
+  lv_obj_add_event_cb(btnCoolUp, cool_up_cb, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *btnCoolDown = lv_btn_create(scr);
+  lv_obj_align(btnCoolDown, LV_ALIGN_RIGHT_MID, -10, 0);
+  lv_obj_t *labelCD = lv_label_create(btnCoolDown);
+  lv_label_set_text(labelCD, "Cool -");
+  lv_obj_add_event_cb(btnCoolDown, cool_down_cb, LV_EVENT_CLICKED, NULL);
+
+  labelCool = lv_label_create(scr);
+  lv_obj_align(labelCool, LV_ALIGN_RIGHT_MID, -10, 40);
+
+  // Mode Button
+  lv_obj_t *btnMode = lv_btn_create(scr);
+  lv_obj_align(btnMode, LV_ALIGN_BOTTOM_LEFT, 20, -20);
+  lv_obj_t *labelM = lv_label_create(btnMode);
+  lv_label_set_text(labelM, "Mode");
+  lv_obj_add_event_cb(btnMode, mode_cb, LV_EVENT_CLICKED, NULL);
+
+  labelMode = lv_label_create(scr);
+  lv_obj_align(labelMode, LV_ALIGN_BOTTOM_LEFT, 20, -60);
+
+  // Fan Button
+  lv_obj_t *btnFan = lv_btn_create(scr);
+  lv_obj_align(btnFan, LV_ALIGN_BOTTOM_MID, 0, -20);
+  lv_obj_t *labelF = lv_label_create(btnFan);
+  lv_label_set_text(labelF, "Fan");
+  lv_obj_add_event_cb(btnFan, fan_cb, LV_EVENT_CLICKED, NULL);
+
+  labelFan = lv_label_create(scr);
+  lv_obj_align(labelFan, LV_ALIGN_BOTTOM_MID, 0, -60);
+
+  // Eco Toggle Button
+  lv_obj_t *btnEco = lv_btn_create(scr);
+  lv_obj_align(btnEco, LV_ALIGN_BOTTOM_RIGHT, -20, -20);
+  lv_obj_t *labelE = lv_label_create(btnEco);
+  lv_label_set_text(labelE, "Eco");
+  lv_obj_add_event_cb(btnEco, eco_cb, LV_EVENT_CLICKED, NULL);
+
+  labelEco = lv_label_create(scr);
+  lv_obj_align(labelEco, LV_ALIGN_BOTTOM_RIGHT, -20, -60);
+
+  // Eco Time Adjustment
+  lv_obj_t *btnEcoStartUp = lv_btn_create(scr);
+  lv_obj_align(btnEcoStartUp, LV_ALIGN_TOP_LEFT, 10, 100);
+  lv_obj_t *labelESU = lv_label_create(btnEcoStartUp);
+  lv_label_set_text(labelESU, "Eco Start +");
+  lv_obj_add_event_cb(btnEcoStartUp, eco_start_up_cb, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *btnEcoStartDown = lv_btn_create(scr);
+  lv_obj_align(btnEcoStartDown, LV_ALIGN_TOP_LEFT, 10, 140);
+  lv_obj_t *labelESD = lv_label_create(btnEcoStartDown);
+  lv_label_set_text(labelESD, "Eco Start -");
+  lv_obj_add_event_cb(btnEcoStartDown, eco_start_down_cb, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *btnEcoEndUp = lv_btn_create(scr);
+  lv_obj_align(btnEcoEndUp, LV_ALIGN_TOP_RIGHT, -10, 100);
+  lv_obj_t *labelEEU = lv_label_create(btnEcoEndUp);
+  lv_label_set_text(labelEEU, "Eco End +");
+  lv_obj_add_event_cb(btnEcoEndUp, eco_end_up_cb, LV_EVENT_CLICKED, NULL);
+
+  lv_obj_t *btnEcoEndDown = lv_btn_create(scr);
+  lv_obj_align(btnEcoEndDown, LV_ALIGN_TOP_RIGHT, -10, 140);
+  lv_obj_t *labelEED = lv_label_create(btnEcoEndDown);
+  lv_label_set_text(labelEED, "Eco End -");
+  lv_obj_add_event_cb(btnEcoEndDown, eco_end_down_cb, LV_EVENT_CLICKED, NULL);
+
+  labelEcoTimes = lv_label_create(scr);
+  lv_obj_align(labelEcoTimes, LV_ALIGN_TOP_MID, 0, 100);
+
+  update_ui();
+}
+
+// -------------------- LVGL Event Callbacks -----------------------
+void heat_up_cb(lv_event_t *e) {
+  lastTouch = millis();
+  heatSetpoint++;
+  save_settings();
+  update_ui();
+}
+
+void heat_down_cb(lv_event_t *e) {
+  lastTouch = millis();
+  heatSetpoint--;
+  save_settings();
+  update_ui();
+}
+
+void cool_up_cb(lv_event_t *e) {
+  lastTouch = millis();
+  coolSetpoint++;
+  save_settings();
+  update_ui();
+}
+
+void cool_down_cb(lv_event_t *e) {
+  lastTouch = millis();
+  coolSetpoint--;
+  save_settings();
+  update_ui();
+}
+
+void mode_cb(lv_event_t *e) {
+  lastTouch = millis();
+  globalMode = (globalMode + 1) % 4; // Off -> Cool -> Heat -> Auto
+  save_settings();
+  update_ui();
+}
+
+void fan_cb(lv_event_t *e) {
+  lastTouch = millis();
+  fanMode = (fanMode + 1) % 2; // Auto -> On
+  save_settings();
+  update_ui();
+}
+
+void eco_cb(lv_event_t *e) {
+  lastTouch = millis();
+  if (ecoModeActive) deactivate_eco_mode();
+  else activate_eco_mode();
+  update_ui();
+}
+
+void eco_start_up_cb(lv_event_t *e) {
+  lastTouch = millis();
+  ecoStartHour = (ecoStartHour + 1) % 24;
+  save_eco_times();
+  update_ui();
+}
+
+void eco_start_down_cb(lv_event_t *e) {
+  lastTouch = millis();
+  ecoStartHour = (ecoStartHour - 1 + 24) % 24;
+  save_eco_times();
+  update_ui();
+}
+
+void eco_end_up_cb(lv_event_t *e) {
+  lastTouch = millis();
+  ecoEndHour = (ecoEndHour + 1) % 24;
+  save_eco_times();
+  update_ui();
+}
+
+void eco_end_down_cb(lv_event_t *e) {
+  lastTouch = millis();
+  ecoEndHour = (ecoEndHour - 1 + 24) % 24;
+  save_eco_times();
+  update_ui();
+}
+
+// -------------------- Update UI -----------------------
+void update_ui() {
+  lv_label_set_text_fmt(labelTemp, "Room Temp: %.1f°F", currentTemp);
+  lv_label_set_text_fmt(labelHeat, "Heat: %d°F", heatSetpoint);
+  lv_label_set_text_fmt(labelCool, "Cool: %d°F", coolSetpoint);
+
+  const char* modes[] = {"Off", "Cool", "Heat", "Auto"};
+  lv_label_set_text_fmt(labelMode, "Mode: %s", modes[globalMode]);
+
+  lv_label_set_text_fmt(labelFan, "Fan: %s", (fanMode == 0) ? "Auto" : "On");
+  lv_label_set_text_fmt(labelEco, "Eco: %s", (ecoModeActive) ? "On" : "Off");
+
+  lv_label_set_text_fmt(labelEcoTimes, "Eco Time: %02d:00 - %02d:00", ecoStartHour, ecoEndHour);
 }
