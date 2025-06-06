@@ -1,7 +1,7 @@
 # RS485Thermostat
 **Replace that awful thermostat with something cool** THIS HAS ONLY BEEN TESTED TO WORK WITH COLEMAN/AIRXCEL 
 
-**What this will do**
+**What this will do**  
 Room Temp: Read from DS18B20  
 Dual Setpoints: Heat + Cool separately adjustable  
 Deadband: 3°F buffer to prevent cycling  
