@@ -7,6 +7,15 @@ Dual Setpoints: Heat + Cool separately adjustable
 Deadband: 3°F buffer to prevent cycling  
 Mode Auto: Automatically heats/cools based on temp  
 Zone 1 & 2 RS485 Control every 5 sec  
+Adjustable Eco Mode Time from screen  
+Auto-dimming screen brightness in Eco  
+Manual Eco toggle button  
+WiFi Reconnect Watchdog  
+OTA Firmware Updates  
+Home Assistant MQTT Auto-Discovery  
+RS485 Dual Zone HVAC Control  
+Save Eco times to flash memory  
+
 
 **Parts Needed:**  
 DS18B20  
