@@ -17,6 +17,9 @@ TTL to RS485 485 to Serial UART Adapter
 **Home Assistant**  
 Just MQTT  
 
+**Code Adjustment**  
+Replace YOUR_WIFI_SSID, YOUR_WIFI_PASSWORD, YOUR_MQTT_BROKER_IP, YOUR_MQTT_USERNAME, YOUR_MQTT_PASSWORD with your real values
+
 ![61R8InXl6RL _SL1010_](https://github.com/user-attachments/assets/fd422baf-c65f-47a9-9630-ac7fad290ecd)
 ![image](https://github.com/user-attachments/assets/9ca14c3d-79ea-415f-9ce3-022ea4fd6c72)
 ![61jsYiEs7xL _SL1010_](https://github.com/user-attachments/assets/84b8aca3-b364-4f2f-ba14-870bb277a020)
