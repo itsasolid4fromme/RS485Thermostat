@@ -3,7 +3,8 @@
 #include <TFT_eSPI.h>          // TFT library for ESP32-S3 screen
 #include <OneWire.h>           // For DS18B20
 #include <DallasTemperature.h> // For DS18B20
-#include "Arduino.h"
+#include <WiFi.h>              // WiFi
+#include <PubSubClient.h>      // MQTT
 
 // --- RS485 Definitions ---
 #define RS485_TX 13
@@ -20,6 +21,17 @@ DallasTemperature sensors(&oneWire);
 // --- LVGL Display Setup ---
 TFT_eSPI tft = TFT_eSPI(); // Use TFT_eSPI
 
+// --- WiFi and MQTT Setup ---
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+const char* mqtt_server = "YOUR_MQTT_BROKER_IP"; // Example: 192.168.1.100
+const char* mqtt_user = "YOUR_MQTT_USERNAME";    // Or leave "" if not needed
+const char* mqtt_password = "YOUR_MQTT_PASSWORD"; // Or leave "" if not needed
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
 // --- Global Variables ---
 lv_obj_t *label_current_temp;
 lv_obj_t *label_heat_sp;
@@ -28,12 +40,9 @@ lv_obj_t *label_status;
 lv_obj_t *label_fan;
 lv_obj_t *label_mode;
 
-uint8_t zone1Temp = 70;
-uint8_t zone2Temp = 72;
-float currentTemp = 72.0;
-
 uint8_t heatSetpoint = 68;
 uint8_t coolSetpoint = 75;
+float currentTemp = 72.0;
 
 uint8_t fanMode = 0; // 0=Auto, 1=High, 2=Low
 uint8_t globalMode = 3; // Start in Auto
@@ -46,6 +55,43 @@ uint8_t globalMode = 3; // Start in Auto
 
 unsigned long lastSend = 0;
 unsigned long lastTempRead = 0;
+
+// --- WiFi Connect ---
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("WiFi connected");
+}
+
+// --- MQTT Connect ---
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect("ESP32Thermostat", mqtt_user, mqtt_password)) {
+      Serial.println("connected");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      delay(5000);
+    }
+  }
+}
+
+// --- MQTT Publish ---
+void mqtt_publish_status() {
+  client.publish("thermostat/current_temp", String(currentTemp).c_str(), true);
+  client.publish("thermostat/heat_setpoint", String(heatSetpoint).c_str(), true);
+  client.publish("thermostat/cool_setpoint", String(coolSetpoint).c_str(), true);
+  client.publish("thermostat/mode", String(globalMode).c_str(), true);
+}
 
 // --- LVGL Flush ---
 void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
@@ -64,10 +110,10 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
 void sendRS485Packet() {
   uint8_t packet[] = {
     0xF6,
-    (uint8_t)(zone1Temp + 82),
+    (uint8_t)(heatSetpoint + 82),
     zone1Mode(),
     fanModeCode(fanMode),
-    (uint8_t)(zone2Temp + 82),
+    (uint8_t)(coolSetpoint + 82),
     zone2Mode(),
     fanModeCode(fanMode),
     0xFF
@@ -97,24 +143,22 @@ uint8_t zone1Mode() {
     if (currentTemp >= coolSetpoint + deadband) return 0x03; // Cool
     return 0x00; // Off
   } else if (globalMode == MODE_COOL) {
-    return 0x03; // Cool
+    return 0x03;
   } else if (globalMode == MODE_HEAT) {
-    return 0x02; // Heat
+    return 0x02;
   }
-  return 0x00; // Off
+  return 0x00;
 }
 
 uint8_t zone2Mode() {
   if (globalMode == MODE_AUTO) {
     float deadband = 3.0;
-    if (currentTemp >= coolSetpoint + deadband) return 0x03; // Cool
-    return 0x00; // Off (No heat in zone 2)
+    if (currentTemp >= coolSetpoint + deadband) return 0x03;
+    return 0x00;
   } else if (globalMode == MODE_COOL) {
-    return 0x03; // Cool
-  } else if (globalMode == MODE_HEAT) {
-    return 0x00; // No heat in zone 2
+    return 0x03;
   }
-  return 0x00; // Off
+  return 0x00;
 }
 
 // --- UI Update ---
@@ -239,6 +283,9 @@ void create_ui() {
 void setup() {
   Serial.begin(115200);
 
+  setup_wifi();
+  client.setServer(mqtt_server, 1883);
+
   // RS485 Setup
   pinMode(RS485_EN, OUTPUT);
   digitalWrite(RS485_EN, LOW);
@@ -269,6 +316,11 @@ void setup() {
 
 // --- Main Loop ---
 void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
   lv_timer_handler();
   delay(5);
 
@@ -277,6 +329,8 @@ void loop() {
     currentTemp = sensors.getTempFByIndex(0);
     update_ui();
     lastTempRead = millis();
+
+    mqtt_publish_status();
   }
 
   if (millis() - lastSend > 5000) {
