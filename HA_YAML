@@ -1,0 +1,13 @@
+climate:
+  - platform: mqtt
+    name: "Living Room Thermostat"
+    modes:
+      - "off"
+      - "cool"
+      - "heat"
+      - "auto"
+    current_temperature_topic: "thermostat/current_temp"
+    temperature_command_topic: "thermostat/set_temp"
+    temperature_state_topic: "thermostat/heat_setpoint"
+    mode_command_topic: "thermostat/set_mode"
+    mode_state_topic: "thermostat/mode"
