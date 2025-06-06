@@ -1,5 +1,5 @@
 # RS485Thermostat
-**Replace that awful thermostat with something cool**
+**Replace that awful thermostat with something cool** THIS HAS ONLY BEEN TESTED TO WORK WITH COLEMAN/AIRXCEL 
 
 Room Temp: Read from DS18B20.
 
